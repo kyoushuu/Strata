@@ -25,6 +25,8 @@ float dot_q6k(const void* w, const Q8K* a, int nb);
 
 namespace avx2 {
 void quantize_q8k(const float* x, Q8K* y, int n);
+// Explicit scalar/vector packing choice for exact-parity and bounded performance tests; same quantization.
+void quantize_q8k_test_pack(const float* x, Q8K* y, int n, bool vector_pack);
 float dot_q4k(const void* w, const Q8K* a, int nb);
 float dot_q5k(const void* w, const Q8K* a, int nb);
 float dot_q6k(const void* w, const Q8K* a, int nb);

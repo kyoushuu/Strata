@@ -34,7 +34,8 @@ int main(int argc, char** argv) {
     // ---------------------------------------------------------------- per-row parity
     struct Case { int layer; const char* name; int cols; };
     std::vector<Case> cases;
-    for (int il = 0; il < 40; ++il) {
+    for (int il = 0; il < 41; ++il) {
+        if (!f.tensor(blk(il, "ffn_gate_exps.weight"))) break;
         const auto& g = f.need(blk(il, "ffn_gate_exps.weight"));
         const auto& d = f.need(blk(il, "ffn_down_exps.weight"));
         static bool seen_g[32] = {}, seen_d[32] = {};

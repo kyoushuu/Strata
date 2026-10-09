@@ -49,6 +49,12 @@ build-vision.bat
 *.done
 /third_party/*.zip
 
+# Pascal-optimized source checkout: local build, generated config, tokenizer and cache/profile state.
+/build-sm61/
+/build-sm61-validation/
+/.local-data/
+/runtime/
+
 
 # Strata-Qwen36: the qwen35moe engine setup_qwen36.py compiles
 /engine-qwen35moe/

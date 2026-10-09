@@ -1132,6 +1132,7 @@ class Service:
                             cvec = (getattr(self.engine, "info", {}) or {}).get("cvec", 0)
                             loaded = str(cvec) not in ("0", "", "None")
                             hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
+                            fresh_prompt = max(0, len(ids) - int(last.get("reused") or 0))
                             self.history.append({
                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False
                                 if loaded else None,
@@ -1139,6 +1140,8 @@ class Service:
                                 "prompt_tokens": len(ids), "reused": last.get("reused"), "output_tokens": n,
                                 "engine_generated": last.get("generated"),
                                 "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
+                                "prefill_tok_s": round(fresh_prompt / (last["prompt_ms"] / 1000), 1)
+                                if fresh_prompt and last.get("prompt_ms") else None,
                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                                 if n and last.get("generated") and last.get("decode_ms") else None,
                                 "hit_rate": hit_rate, "ram_blobs": last.get("ram_blobs"),

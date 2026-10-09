@@ -3,12 +3,17 @@
 // The K-quant dot products follow the block layouts of ggml (MIT); the lane mapping is this engine's own:
 // 8 lanes per 256-value super-block, 16 bytes of quants per lane, activations quantized to int8 per 32 values.
 #include "kernels.cuh"
+#include "actq_readonly.cuh"
+#include "dense_q6.cuh"
 
 #include "common.hpp"
 #include "quant.hpp"
+#include "iq_native.cuh"
 
 #include <cub/block/block_radix_sort.cuh>
 #include <cuda_fp16.h>
+#include <cstdlib>
+#include <cstring>
 
 namespace sq {
 
@@ -181,7 +186,7 @@ __global__ void mtp_in_kernel(const StepParams* P, const float* __restrict__ h, 
 constexpr int kGemvWarps = 8;
 
 /// One row per warp; the NT activation vectors sit in shared memory and every weight load serves all of them.
-template <int NT>
+template <int NT, bool ReadOnly = false>
 __global__ void __launch_bounds__(kGemvWarps * 32) gemv_q8_kernel(const int8_t* __restrict__ wq, const __half* __restrict__ wd,
                                                                   ActQ a, float* __restrict__ y, int rows, int cols) {
     extern __shared__ int4 smem[];
@@ -189,8 +194,8 @@ __global__ void __launch_bounds__(kGemvWarps * 32) gemv_q8_kernel(const int8_t* 
     const int nsc = cols >> 5;      // scales per row
     int4* sa = smem;
     float* sd = (float*)(smem + NT * nvec);
-    for (int i = threadIdx.x; i < NT * nvec; i += blockDim.x) sa[i] = ((const int4*)a.q)[i];
-    for (int i = threadIdx.x; i < NT * nsc; i += blockDim.x) sd[i] = a.d[i];
+    for (int i = threadIdx.x; i < NT * nvec; i += blockDim.x) sa[i] = actq_load<ReadOnly>((const int4*)a.q + i);
+    for (int i = threadIdx.x; i < NT * nsc; i += blockDim.x) sd[i] = actq_load<ReadOnly>(a.d + i);
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row = blockIdx.x * kGemvWarps + warp;
@@ -355,14 +360,20 @@ template <uint32_t T>
 __device__ __forceinline__ float dot_c(const uint8_t* blk, int c, ActSB a) {
     if constexpr (T == T_Q4_K) return dot_q4k_c(blk, c, a);
     else if constexpr (T == T_Q5_K) return dot_q5k_c(blk, c, a);
+    else if constexpr (T == T_IQ2_S || T == T_IQ3_S || T == T_IQ4_XS || T == T_Q2_K || T == T_Q3_K)
+        return iq_native::dot_32<T>(blk, c, a.q + 32 * c, a.d[c]);
     else return dot_q6k_c(blk, c, a);
 }
 
-template <uint32_t T> constexpr int blk_bytes() { return T == T_Q4_K ? 144 : T == T_Q5_K ? 176 : 210; }
+template <uint32_t T> constexpr int blk_bytes() {
+    return T == T_Q2_K ? 84 : T == T_Q3_K ? 110 :
+           T == T_IQ2_S ? 82 : T == T_IQ3_S ? 110 : T == T_IQ4_XS ? 136 :
+           T == T_Q4_K ? 144 : T == T_Q5_K ? 176 : 210;
+}
 
 /// Dot of one quantized row of NSB super-blocks with the activation in shared memory.  The row is split over
 /// LPR = min(32, NSB * 8) lanes; returns the full sum on every one of those lanes.
-template <uint32_t T, int NSB>
+template <uint32_t T, int NSB, bool Transpose = false>
 __device__ __forceinline__ float row_dot(const uint8_t* row, const int8_t* aq, const float* ad, const float* as, int lane_in_row) {
     constexpr int LPR = NSB * 8 < 32 ? NSB * 8 : 32;
     constexpr int PASSES = NSB * 8 / LPR;
@@ -371,40 +382,110 @@ __device__ __forceinline__ float row_dot(const uint8_t* row, const int8_t* aq, c
     for (int p = 0; p < PASSES; ++p) {
         const int sb = p * (LPR / 8) + (lane_in_row >> 3);
         const int c = lane_in_row & 7;
-        acc += dot_c<T>(row + sb * blk_bytes<T>(), c, ActSB{aq + sb * 256, ad + sb * 8, as + sb * 8});
+        if constexpr (Transpose)
+            acc += iq_native::dot_32<T, NSB * 8 + 1>(row + sb * blk_bytes<T>(), c,
+                                                      aq + 4 * (sb * 8 + c), ad[sb * 8 + c]);
+        else acc += dot_c<T>(row + sb * blk_bytes<T>(), c, ActSB{aq + sb * 256, ad + sb * 8, as + sb * 8});
     }
 #pragma unroll
     for (int o = LPR / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
     return acc;
 }
 
+// Native packed experts: unpack each lane's weight group once for every token routed to this expert.
+// Keep row_dot's super-block passes and XOR reduction sequence separately for each token.
+template <uint32_t Type, int NSB, int NT, bool Transpose = false>
+__device__ __forceinline__ void row_dot_reuse(const uint8_t* row, const int8_t* aq, const float* ad,
+                                              const int (&input_rows)[NT], int lane_in_row, float (&acc)[NT]) {
+    constexpr int LPR = NSB * 8 < 32 ? NSB * 8 : 32;
+    constexpr int PASSES = NSB * 8 / LPR;
+    unsigned active = 0;
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        acc[t] = 0.0f;
+        if (input_rows[t] >= 0) active |= 1u << t;
+    }
+#pragma unroll
+    for (int p = 0; p < PASSES; ++p) {
+        const int sb = p * (LPR / 8) + (lane_in_row >> 3), group = lane_in_row & 7;
+        const int8_t* token_q[NT];
+        float token_d[NT];
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            if constexpr (Transpose)
+                token_q[t] = input_rows[t] >= 0 ? aq + input_rows[t] * ((NSB * 8 + 1) * 32) + 4 * (sb * 8 + group) : nullptr;
+            else token_q[t] = input_rows[t] >= 0 ? aq + input_rows[t] * (NSB * 256) + sb * 256 + group * 32 : nullptr;
+            token_d[t] = input_rows[t] >= 0 ? ad[input_rows[t] * (NSB * 8) + sb * 8 + group] : 0.0f;
+        }
+        // Accumulate in the same expression as row_dot's inlined scalar helper. Materializing an array
+        // of rounded contributions first prevents its final multiply/add contraction on the second pass.
+        iq_native::dot_32_multi<Type, NT, true, Transpose ? NSB * 8 + 1 : 1>(
+            row + sb * blk_bytes<Type>(), group, token_q, token_d, active, acc);
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+#pragma unroll
+        for (int o = LPR / 2; o > 0; o >>= 1) acc[t] += __shfl_xor_sync(0xffffffffu, acc[t], o);
+    }
+}
+
 // =====================================================================================================================
 // MoE: resident experts on the GPU
 // =====================================================================================================================
+// Transpose 8 int32 words/group into word planes. Consecutive dot-product lanes then read consecutive banks,
+// replacing the contiguous layout's stride-eight shared loads. One padding group keeps different planes from
+// all landing on the same banks during the one-time staging copy, with only 32 extra bytes per activation row.
+template <int Cols>
+__device__ __forceinline__ void stage_native_transpose(int8_t* shared, const int8_t* global, int rows) {
+    constexpr int Groups = Cols / 32, Plane = Groups + 1;
+    for (int i = threadIdx.x; i < rows * Cols / 4; i += blockDim.x) {
+        const int row = i / (Cols / 4), q = i % (Cols / 4);
+        ((int*)shared)[row * (8 * Plane) + (q & 7) * Plane + (q >> 3)] = ((const int*)global)[i];
+    }
+}
+
 /// gate|up (1024 rows x 2048) of each hit expert: grid (1024/8, distinct experts), one row per warp.  The row is
 /// dotted with every token that picked the expert (the repeated loads come from L1).
-template <uint32_t T, int NT>
+template <uint32_t T, int NT, bool Reuse = false, bool Transpose = false>
 __global__ void __launch_bounds__(256) moe_gu_kernel(ActQ x, const HitList* __restrict__ hits, float* __restrict__ h_gu) {
     const int j = blockIdx.y;
     if (j >= hits->n) return;
-    __shared__ __align__(16) int8_t sq[NT * kE];
-    __shared__ float sd[NT * kE / 32], ss[NT * kE / 32];
-    for (int i = threadIdx.x; i < NT * kE / 16; i += blockDim.x) ((int4*)sq)[i] = ((const int4*)x.q)[i];
+    constexpr bool NeedSum = !Transpose; // preserve baseline layout; native transposed helpers never read ActQ.s
+    constexpr int QBytes = Transpose ? kE + 32 : kE;
+    __shared__ __align__(16) int8_t sq[NT * QBytes];
+    __shared__ float sd[NT * kE / 32], ss[NeedSum ? NT * kE / 32 : 1];
+    if constexpr (Transpose) stage_native_transpose<kE>(sq, x.q, NT);
+    else for (int i = threadIdx.x; i < NT * kE / 16; i += blockDim.x) ((int4*)sq)[i] = ((const int4*)x.q)[i];
     for (int i = threadIdx.x; i < NT * kE / 32; i += blockDim.x) {
         sd[i] = x.d[i];
-        ss[i] = x.s[i];
+        if constexpr (NeedSum) ss[i] = x.s[i];
     }
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row = blockIdx.x * 8 + warp;
     constexpr int64_t rb = (int64_t)(kE / 256) * blk_bytes<T>();
     const uint8_t* w = hits->ptr[j] + row * rb;
+    if constexpr (Reuse && NT > 1) {
+        int inputs[NT], pairs[NT];
 #pragma unroll
-    for (int t = 0; t < NT; ++t) {
-        const int p = NT == 1 ? j : hits->pair[j][t];
-        if (p < 0) continue;
-        const float r = row_dot<T, kE / 256>(w, sq + t * kE, sd + t * kE / 32, ss + t * kE / 32, lane);
-        if (lane == 0) h_gu[p * 2 * kFF + row] = r;
+        for (int t = 0; t < NT; ++t) {
+            pairs[t] = hits->pair[j][t];
+            inputs[t] = pairs[t] >= 0 ? t : -1;
+        }
+        float values[NT];
+        row_dot_reuse<T, kE / 256, NT, Transpose>(w, sq, sd, inputs, lane, values);
+#pragma unroll
+        for (int t = 0; t < NT; ++t)
+            if (lane == 0 && pairs[t] >= 0) h_gu[pairs[t] * 2 * kFF + row] = values[t];
+    } else {
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            const int p = NT == 1 ? j : hits->pair[j][t];
+            if (p < 0) continue;
+            const float r = row_dot<T, kE / 256, Transpose>(w, sq + t * QBytes, sd + t * kE / 32,
+                                                            ss + (NeedSum ? t * kE / 32 : 0), lane);
+            if (lane == 0) h_gu[p * 2 * kFF + row] = r;
+        }
     }
 }
 
@@ -418,16 +499,19 @@ __global__ void moe_act_kernel(const float* __restrict__ h_gu, const HitList* __
 }
 
 /// down (2048 rows x 512) summed over the hit experts, per token: two rows per warp (16 lanes per row).
-template <uint32_t T, int NT>
+template <uint32_t T, int NT, bool Reuse = false, bool Transpose = false>
 __global__ void __launch_bounds__(256) moe_down_kernel(int64_t down_off, ActQ hq, const HitList* __restrict__ hits,
                                                        float* __restrict__ out) {
     const int n = hits->n, np = hits->n_pair;
-    __shared__ __align__(16) int8_t sq[NT * kMaxK * kFF];
-    __shared__ float sd[NT * kMaxK * kFF / 32], ss[NT * kMaxK * kFF / 32];
-    for (int i = threadIdx.x; i < np * kFF / 16; i += blockDim.x) ((int4*)sq)[i] = ((const int4*)hq.q)[i];
+    constexpr bool NeedSum = !Transpose;
+    constexpr int QBytes = Transpose ? kFF + 32 : kFF;
+    __shared__ __align__(16) int8_t sq[NT * kMaxK * QBytes];
+    __shared__ float sd[NT * kMaxK * kFF / 32], ss[NeedSum ? NT * kMaxK * kFF / 32 : 1];
+    if constexpr (Transpose) stage_native_transpose<kFF>(sq, hq.q, np);
+    else for (int i = threadIdx.x; i < np * kFF / 16; i += blockDim.x) ((int4*)sq)[i] = ((const int4*)hq.q)[i];
     for (int i = threadIdx.x; i < np * kFF / 32; i += blockDim.x) {
         sd[i] = hq.d[i];
-        ss[i] = hq.s[i];
+        if constexpr (NeedSum) ss[i] = hq.s[i];
     }
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -438,17 +522,34 @@ __global__ void __launch_bounds__(256) moe_down_kernel(int64_t down_off, ActQ hq
     for (int t = 0; t < NT; ++t) acc[t] = 0.0f;
     for (int j = 0; j < n; ++j) {
         const uint8_t* w = hits->ptr[j] + down_off + row * rb;
+        if constexpr (Reuse && NT > 1) {
+            int inputs[NT];
 #pragma unroll
-        for (int t = 0; t < NT; ++t) {
-            const int p = NT == 1 ? j : hits->pair[j][t];
-            if (p < 0) continue;
-            acc[t] += hits->w[j][t] * row_dot<T, kFF / 256>(w, sq + p * kFF, sd + p * kFF / 32, ss + p * kFF / 32, lane & 15);
+            for (int t = 0; t < NT; ++t) inputs[t] = hits->pair[j][t];
+            float values[NT];
+            row_dot_reuse<T, kFF / 256, NT, Transpose>(w, sq, sd, inputs, lane & 15, values);
+#pragma unroll
+            for (int t = 0; t < NT; ++t)
+                if (inputs[t] >= 0) acc[t] += hits->w[j][t] * values[t];
+        } else {
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                const int p = NT == 1 ? j : hits->pair[j][t];
+                if (p < 0) continue;
+                acc[t] += hits->w[j][t] * row_dot<T, kFF / 256, Transpose>(w, sq + p * QBytes,
+                    sd + p * kFF / 32, ss + (NeedSum ? p * kFF / 32 : 0), lane & 15);
+            }
         }
     }
     if ((lane & 15) == 0) {
 #pragma unroll
         for (int t = 0; t < NT; ++t) out[t * kE + row] = acc[t];
     }
+}
+
+__global__ void add_expert_output_kernel(float* __restrict__ destination, const float* __restrict__ source, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) destination[i] += source[i];
 }
 
 /// grid (n_ff / 256, T)
@@ -460,6 +561,7 @@ __global__ void swiglu_q_kernel(const float* __restrict__ gu, ActQ out, int n_ff
 // =====================================================================================================================
 // router: softmax over 256 experts, top-8, split into resident (GPU) and missing (CPU mailbox)
 // =====================================================================================================================
+template <bool SystemFence>
 __global__ void __launch_bounds__(256) router_kernel(const float* __restrict__ logits, int layer, const int32_t* __restrict__ residency,
                                                      const CacheLayerInfo* __restrict__ cinfo, const float* __restrict__ xn,
                                                      HitList* hits, Mailbox* mb, const StepParams* P, int32_t* d_nmiss,
@@ -539,11 +641,11 @@ __global__ void __launch_bounds__(256) router_kernel(const float* __restrict__ l
     __syncthreads();
     if (s_nm > 0) {   // the CPU reads x only when it has experts to run
         for (int i = t; i < kE; i += blockDim.x) mb->x[0][i] = xn[i];
-        __threadfence_system();   // each writer makes its own mailbox stores visible before the flag
+        if constexpr (SystemFence) __threadfence_system();   // mapped-host polling needs each writer's visibility
     }
     __syncthreads();
     if (t == 0) {
-        __threadfence_system();
+        if constexpr (SystemFence) __threadfence_system();
         *(volatile uint32_t*)&mb->ready_seq = P->seq;
     }
 }
@@ -551,6 +653,7 @@ __global__ void __launch_bounds__(256) router_kernel(const float* __restrict__ l
 /// Router for a step of T > 1 tokens: warp t picks token t's top 8 (as above), then thread e collects expert e over
 /// the tokens.  Distinct experts are listed in id order, resident ones in the HitList (with their (expert, token)
 /// pair indices), missing ones in the mailbox.
+template <bool SystemFence>
 __global__ void __launch_bounds__(256) router_multi_kernel(const float* __restrict__ logits, int layer,
                                                            const int32_t* __restrict__ residency,
                                                            const CacheLayerInfo* __restrict__ cinfo, const float* __restrict__ xn,
@@ -659,16 +762,19 @@ __global__ void __launch_bounds__(256) router_multi_kernel(const float* __restri
         mb->n_miss = nm;
         mb->n_tok = T;
         *d_nmiss = nm;
-        ecount[0] += nh;
-        ecount[1] += nm;
+        // User-facing hit rate counts routed (expert, token) pairs, as T==1 does.
+        // nh/nm still count distinct experts for batched CPU/GPU execution, but
+        // a hot expert reused by four tokens must contribute four cache hits.
+        ecount[0] += npair;
+        ecount[1] += T * kMaxK - npair;
     }
     if (nm > 0) {   // the CPU reads x only when it has experts to run
         for (int i = tid; i < T * kE; i += blockDim.x) mb->x[i / kE][i % kE] = xn[i];
-        __threadfence_system();   // each writer makes its own mailbox stores visible before the flag
+        if constexpr (SystemFence) __threadfence_system();   // mapped-host polling needs each writer's visibility
     }
     __syncthreads();
     if (tid == 0) {
-        __threadfence_system();
+        if constexpr (SystemFence) __threadfence_system();
         *(volatile uint32_t*)&mb->ready_seq = P->seq;
     }
 }
@@ -696,7 +802,9 @@ __global__ void __launch_bounds__(256) combine_kernel(float* __restrict__ x, con
             unsigned long long g0, g1;
             asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(g0));
             while (*(volatile const uint32_t*)&res->done_seq != seq) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
                 __nanosleep(64);
+#endif
                 if (clock64() - t0 > (1ll << 35)) {   // ~10 s: the CPU side is gone; do not hang the GPU (TDR)
                     *err = 1;
                     waited_ok = 0;
@@ -799,6 +907,90 @@ __global__ void __launch_bounds__(128) gdn_recur_kernel(const float* __restrict_
         const float a = ba[t * 64 + kVH + h] + dt_bias[h];
         const float sp = a > 20.0f ? a : log1pf(__expf(a));
         const float decay = __expf(sp * ssm_a[h]);
+        float kv = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            kr[i] *= kn;
+            kv += s[i] * kr[i];
+        }
+        kv = warp_sum(kv);
+        const float delta = (v - decay * kv) * beta;
+        float out = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            s[i] = decay * s[i] + kr[i] * delta;
+            out += s[i] * qr[i];
+        }
+        out = warp_sum(out) * qn;
+        if (lane == 0) o[t * 4096 + h * kDS + col] = out;
+        if (snap && t + 1 < NT) {
+            float* sn = snap + t * snap_stride + ((size_t)h * kDS + col) * kDS;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) sn[lane + 32 * i] = s[i];
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) S[lane + 32 * i] = s[i];
+}
+
+
+// The four factors are invariant across all 128 state columns of one value head.
+// Keep the exact original lane assignment, sum order and scalar expressions. Store
+// only finalized FP32 values; recurrence still applies kn/qn in the original places.
+// Caller owns T*32 float4 scratch on this stream; it must not alias input/state/output.
+__global__ void gdn_prepare_kernel(const float* __restrict__ conv, const float* __restrict__ ba,
+                                   const float* __restrict__ dt_bias, const float* __restrict__ ssm_a,
+                                   float4* __restrict__ factors) {
+    const int h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x;
+    const int kh = h % kKH;
+    const float* ct = conv + t * kConv;
+    const float* q = ct + kh * kDS;
+    const float* k = ct + kKH * kDS + kh * kDS;
+    float qr[4], kr[4];
+    float qs = 0.0f, ks = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        qr[i] = q[lane + 32 * i];
+        kr[i] = k[lane + 32 * i];
+        qs += qr[i] * qr[i];
+        ks += kr[i] * kr[i];
+    }
+    qs = warp_sum(qs);
+    ks = warp_sum(ks);
+    const float qn = rsqrtf(qs + 1e-6f) * rsqrtf((float)kDS);
+    const float kn = rsqrtf(ks + 1e-6f);
+    const float beta = sigmoidf_(ba[t * 64 + h]);
+    const float a = ba[t * 64 + kVH + h] + dt_bias[h];
+    const float sp = a > 20.0f ? a : log1pf(__expf(a));
+    const float decay = __expf(sp * ssm_a[h]);
+    if (lane == 0) factors[t * kVH + h] = make_float4(qn, kn, beta, decay);
+}
+
+template <int NT>
+__global__ void __launch_bounds__(128) gdn_recur_prepared_kernel(const float* __restrict__ conv, const float4* __restrict__ factors,
+                                                        float* __restrict__ state, float* __restrict__ o,
+                                                        float* __restrict__ snap, int64_t snap_stride) {
+    const int h = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int col = blockIdx.y * 4 + warp;
+    const int kh = h % kKH;
+    float* S = state + ((size_t)h * kDS + col) * kDS;
+    float s[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) s[i] = S[lane + 32 * i];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        const float* ct = conv + t * kConv;
+        const float* q = ct + kh * kDS;
+        const float* k = ct + kKH * kDS + kh * kDS;
+        const float v = ct[2 * kKH * kDS + h * kDS + col];
+        float qr[4], kr[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            qr[i] = q[lane + 32 * i];
+            kr[i] = k[lane + 32 * i];
+        }
+        const float4 f = factors[t * kVH + h];
+        const float qn = f.x, kn = f.y, beta = f.z, decay = f.w;
         float kv = 0.0f;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -1029,24 +1221,37 @@ __device__ __forceinline__ void argmax_sum_merge(float& v, int& idx, float& s, f
     argmax_merge(v, idx, ov, oi);
 }
 
-/// Block reduction of (v, idx, s) over 256 threads; the result is valid in thread 0.
+/// Block reduction of (v, idx, optional s) over 256 threads; the result is valid in thread 0.
+template <bool WithProb>
 __device__ __forceinline__ void block_argmax_sum256(float& v, int& idx, float& s) {
     __shared__ float bv[8], bs[8];
     __shared__ int bi[8];
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
-        const float ov = __shfl_xor_sync(0xffffffffu, v, o), os = __shfl_xor_sync(0xffffffffu, s, o);
+        const float ov = __shfl_xor_sync(0xffffffffu, v, o);
         const int oi = __shfl_xor_sync(0xffffffffu, idx, o);
-        argmax_sum_merge(v, idx, s, ov, oi, os);
+        if constexpr (WithProb) {
+            const float os = __shfl_xor_sync(0xffffffffu, s, o);
+            argmax_sum_merge(v, idx, s, ov, oi, os);
+        } else {
+            argmax_merge(v, idx, ov, oi);
+        }
     }
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    if (lane == 0) { bv[warp] = v; bi[warp] = idx; bs[warp] = s; }
+    if (lane == 0) {
+        bv[warp] = v; bi[warp] = idx;
+        if constexpr (WithProb) bs[warp] = s;
+    }
     __syncthreads();
     if (threadIdx.x == 0)
-        for (int i = 1; i < 8; ++i) argmax_sum_merge(v, idx, s, bv[i], bi[i], bs[i]);
+        for (int i = 1; i < 8; ++i) {
+            if constexpr (WithProb) argmax_sum_merge(v, idx, s, bv[i], bi[i], bs[i]);
+            else argmax_merge(v, idx, bv[i], bi[i]);
+        }
 }
 
 /// grid (kArgmaxBlocks, T)
+template <bool WithProb>
 __global__ void __launch_bounds__(256) argmax_stage1(const float* __restrict__ x, int n) {
     const int row = blockIdx.y;
     x += (size_t)row * n;
@@ -1057,28 +1262,36 @@ __global__ void __launch_bounds__(256) argmax_stage1(const float* __restrict__ x
     for (int i = i0 + threadIdx.x; i < i1; i += 256) {   // online: s = sum exp(x - v) over what was seen
         const float xi = x[i];
         if (xi > v) {
-            s = (v == -INFINITY ? 0.0f : s * __expf(v - xi)) + 1.0f;
+            if constexpr (WithProb) s = (v == -INFINITY ? 0.0f : s * __expf(v - xi)) + 1.0f;
             v = xi;
             idx = i;
         } else {
-            s += __expf(xi - v);
+            if constexpr (WithProb) s += __expf(xi - v);
         }
     }
-    block_argmax_sum256(v, idx, s);
-    if (threadIdx.x == 0) { g_argmax_v[row][blockIdx.x] = v; g_argmax_i[row][blockIdx.x] = idx; g_argmax_s[row][blockIdx.x] = s; }
+    block_argmax_sum256<WithProb>(v, idx, s);
+    if (threadIdx.x == 0) {
+        g_argmax_v[row][blockIdx.x] = v; g_argmax_i[row][blockIdx.x] = idx;
+        if constexpr (WithProb) g_argmax_s[row][blockIdx.x] = s;
+    }
 }
 
 /// grid T.  prob (optional): softmax probability of the argmax.
+template <bool WithProb>
 __global__ void __launch_bounds__(256) argmax_stage2(int32_t* out, float* prob) {
     const int row = blockIdx.x;
     float v = -INFINITY, s = 0.0f;
     int idx = 0x7fffffff;
-    for (int i = threadIdx.x; i < kArgmaxBlocks; i += 256)
-        argmax_sum_merge(v, idx, s, g_argmax_v[row][i], g_argmax_i[row][i], g_argmax_s[row][i]);
-    block_argmax_sum256(v, idx, s);
+    for (int i = threadIdx.x; i < kArgmaxBlocks; i += 256) {
+        if constexpr (WithProb)
+            argmax_sum_merge(v, idx, s, g_argmax_v[row][i], g_argmax_i[row][i], g_argmax_s[row][i]);
+        else
+            argmax_merge(v, idx, g_argmax_v[row][i], g_argmax_i[row][i]);
+    }
+    block_argmax_sum256<WithProb>(v, idx, s);
     if (threadIdx.x == 0) {
         out[row] = idx;
-        if (prob) prob[row] = 1.0f / s;
+        if constexpr (WithProb) prob[row] = 1.0f / s;
     }
 }
 
@@ -1143,6 +1356,24 @@ __global__ void count_token_kernel(uint32_t* counts, const int32_t* token) {
     if (token[1] >= 0 && counts[token[1]] > 0) counts[token[1]] -= 1;
 }
 
+bool gpu_expert_reuse_enabled() {
+    // The T=1 and legacy K-quant paths are unchanged. Pascal register pressure must be measured before
+    // making reuse a default; a process-level opt-in also keeps captured launch selection stable.
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GPU_EXPERT_REUSE");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+bool gpu_expert_transpose_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GPU_EXPERT_TRANSPOSE");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
 }  // namespace
 
 // =====================================================================================================================
@@ -1155,6 +1386,14 @@ __global__ void count_token_kernel(uint32_t* counts, const int32_t* token) {
         case 3: { constexpr int NT = 3; CALL; } break;                          \
         case 4: { constexpr int NT = 4; CALL; } break;                          \
         default: die("step of %d tokens (max %d)", T, kMaxT);                   \
+    }
+
+#define SQ_MULTI_NT_SWITCH(T, CALL)                                             \
+    switch (T) {                                                                \
+        case 2: { constexpr int NT = 2; CALL; } break;                          \
+        case 3: { constexpr int NT = 3; CALL; } break;                          \
+        case 4: { constexpr int NT = 4; CALL; } break;                          \
+        default: die("expert reuse requires 2..4 tokens, got %d", T);          \
     }
 
 void k_embed_in(const StepParams* P, float* x, int T, cudaStream_t s) {
@@ -1174,10 +1413,19 @@ void k_mtp_in(const StepParams* P, const float* h, const float* enorm, const flo
     mtp_in_kernel<<<dim3(T, 2), 256, 0, s>>>(P, h, enorm, hnorm, eps, out);
 }
 
-void k_gemv_q8(const DQ8& W, ActQ a, float* y, int T, cudaStream_t s) {
+void k_test_gemv_q8(const DQ8& W, ActQ a, float* y, int T, bool readonly, cudaStream_t s) {
+    if (W.q6) { k_gemv_q6(W, a, y, T, s); return; }
     const int blocks = (W.rows + kGemvWarps - 1) / kGemvWarps;
     const size_t smem = ((size_t)W.cols + (size_t)(W.cols / 32) * 4) * T;
-    SQ_NT_SWITCH(T, (gemv_q8_kernel<NT><<<blocks, kGemvWarps * 32, smem, s>>>(W.qs, (const __half*)W.d, a, y, W.rows, W.cols)));
+    if (readonly) {
+        SQ_NT_SWITCH(T, (gemv_q8_kernel<NT, true><<<blocks, kGemvWarps * 32, smem, s>>>(W.qs, (const __half*)W.d, a, y, W.rows, W.cols)));
+    } else {
+        SQ_NT_SWITCH(T, (gemv_q8_kernel<NT, false><<<blocks, kGemvWarps * 32, smem, s>>>(W.qs, (const __half*)W.d, a, y, W.rows, W.cols)));
+    }
+}
+
+void k_gemv_q8(const DQ8& W, ActQ a, float* y, int T, cudaStream_t s) {
+    k_test_gemv_q8(W, a, y, T, actq_readonly_enabled(), s);
 }
 
 void k_gemv_f32(const DF32& W, const float* x, float* y, int T, cudaStream_t s) {
@@ -1190,10 +1438,27 @@ void k_gdn_conv(const float* qkvz, float* conv_state, const float* conv_w, float
     gdn_conv_kernel<<<kConv / 256, 256, 0, s>>>(qkvz, conv_state, conv_w, conv_out, T, snap, snap_stride);
 }
 
+bool gdn_prepare_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_GDN_PREPARE");
+        if (!value) return false;
+        SQ_CHECK(std::strcmp(value, "0") == 0 || std::strcmp(value, "1") == 0,
+                 "STRATA_GDN_PREPARE must be 0 or 1");
+        return value[0] == '1';
+    }();
+    return enabled;
+}
+
 void k_gdn_recur(const float* conv_out, const float* ba, const float* dt_bias, const float* ssm_a, float* state,
-                 float* o, int T, float* snap, int64_t snap_stride, cudaStream_t s) {
-    SQ_NT_SWITCH(T, (gdn_recur_kernel<NT><<<dim3(kVH, kDS / 4), 128, 0, s>>>(conv_out, ba, dt_bias, ssm_a, state, o, snap,
-                                                                             snap_stride)));
+                 float* o, int T, float* snap, int64_t snap_stride, cudaStream_t s, float* prepared_factors) {
+    if (prepared_factors) {
+        gdn_prepare_kernel<<<dim3(kVH, T), 32, 0, s>>>(conv_out, ba, dt_bias, ssm_a, (float4*)prepared_factors);
+        SQ_NT_SWITCH(T, (gdn_recur_prepared_kernel<NT><<<dim3(kVH, kDS / 4), 128, 0, s>>>(
+            conv_out, (const float4*)prepared_factors, state, o, snap, snap_stride)));
+    } else {
+        SQ_NT_SWITCH(T, (gdn_recur_kernel<NT><<<dim3(kVH, kDS / 4), 128, 0, s>>>(conv_out, ba, dt_bias, ssm_a, state, o, snap,
+                                                                                 snap_stride)));
+    }
 }
 
 void k_gdn_norm_gate(const float* o, const float* qkvz, const float* norm_w, float eps, ActQ yq, int T, cudaStream_t s) {
@@ -1220,23 +1485,74 @@ void k_attn_combine(const float* part_o, const float* part_ml, const float* qkv,
     attn_combine_kernel<<<dim3(kNH, T), 256, 0, s>>>(part_o, part_ml, qkv, P, oq);
 }
 
+void k_test_router(const float* logits, int layer, const int32_t* residency, const CacheLayerInfo* cinfo, const float* xn,
+              HitList* hits, Mailbox* mb_dev, const StepParams* P, int32_t* d_nmiss, float* d_sg, uint32_t* counts,
+              unsigned long long* ecount, int T, cudaStream_t s, bool omit_system_fence) {
+    // The fence-free specialization is valid only for ordinary device memory. The event path copies the
+    // mailbox on this same stream after kernel completion, then waits for the copy's completion event.
+    // Keep every block barrier and every store; only legacy CPU polling needs system visibility mid-kernel.
+    if (omit_system_fence) {
+        if (T == 1)
+            router_kernel<false><<<1, 256, 0, s>>>(logits, layer, residency, cinfo, xn, hits, mb_dev, P, d_nmiss, d_sg, counts, ecount);
+        else
+            router_multi_kernel<false><<<1, 256, 0, s>>>(logits, layer, residency, cinfo, xn, hits, mb_dev, P, d_nmiss, d_sg, counts, ecount, T);
+    } else {
+        if (T == 1)
+            router_kernel<true><<<1, 256, 0, s>>>(logits, layer, residency, cinfo, xn, hits, mb_dev, P, d_nmiss, d_sg, counts, ecount);
+        else
+            router_multi_kernel<true><<<1, 256, 0, s>>>(logits, layer, residency, cinfo, xn, hits, mb_dev, P, d_nmiss, d_sg, counts, ecount, T);
+    }
+}
+
 void k_router(const float* logits, int layer, const int32_t* residency, const CacheLayerInfo* cinfo, const float* xn,
               HitList* hits, Mailbox* mb_dev, const StepParams* P, int32_t* d_nmiss, float* d_sg, uint32_t* counts,
-              unsigned long long* ecount, int T, cudaStream_t s) {
-    if (T == 1)
-        router_kernel<<<1, 256, 0, s>>>(logits, layer, residency, cinfo, xn, hits, mb_dev, P, d_nmiss, d_sg, counts, ecount);
-    else
-        router_multi_kernel<<<1, 256, 0, s>>>(logits, layer, residency, cinfo, xn, hits, mb_dev, P, d_nmiss, d_sg, counts,
-                                              ecount, T);
+              unsigned long long* ecount, int T, cudaStream_t s, bool device_mailbox) {
+    static const bool device_fence_optimization = [] {
+        const char* value = std::getenv("STRATA_ROUTER_DEVICE_FENCE");
+        return value && std::atoi(value) != 0;
+    }();
+    k_test_router(logits, layer, residency, cinfo, xn, hits, mb_dev, P, d_nmiss, d_sg, counts, ecount, T, s,
+                  device_mailbox && device_fence_optimization);
 }
 
 void k_swiglu_q(const float* gu, ActQ out, int n_ff, int T, cudaStream_t s) {
     swiglu_q_kernel<<<dim3((n_ff + 255) / 256, T), 256, 0, s>>>(gu, out, n_ff);
 }
 
-void k_moe_gu(uint32_t type, ActQ x, const HitList* hits, float* h_gu, int T, cudaStream_t s) {
-    const dim3 grid(2 * kFF / 8, kMaxK * T);
+void k_test_moe_gu(uint32_t type, ActQ x, const HitList* hits, float* h_gu, int T, bool reuse, cudaStream_t s, bool transpose,
+                   int known_experts) {
+    SQ_CHECK(known_experts >= 0 && known_experts <= kMaxK * T, "invalid host-known expert launch bound");
+    const dim3 grid(2 * kFF / 8, known_experts ? known_experts : kMaxK * T);
+    if (transpose) {
+#define SQ_TRANSPOSE_GU_CASE(Type) \
+        case Type: \
+            if (T > 1 && reuse) { SQ_MULTI_NT_SWITCH(T, (moe_gu_kernel<Type, NT, true, true><<<grid, 256, 0, s>>>(x, hits, h_gu))); } \
+            else { SQ_NT_SWITCH(T, (moe_gu_kernel<Type, NT, false, true><<<grid, 256, 0, s>>>(x, hits, h_gu))); } \
+            return
+        switch (type) {
+            SQ_TRANSPOSE_GU_CASE(T_Q2_K);
+            SQ_TRANSPOSE_GU_CASE(T_Q3_K);
+            SQ_TRANSPOSE_GU_CASE(T_IQ2_S);
+            SQ_TRANSPOSE_GU_CASE(T_IQ3_S);
+            SQ_TRANSPOSE_GU_CASE(T_IQ4_XS);
+        }
+#undef SQ_TRANSPOSE_GU_CASE
+    }
+    if (T > 1 && reuse) {
+        switch (type) {
+            case T_Q2_K: SQ_MULTI_NT_SWITCH(T, (moe_gu_kernel<T_Q2_K, NT, true><<<grid, 256, 0, s>>>(x, hits, h_gu))); return;
+            case T_Q3_K: SQ_MULTI_NT_SWITCH(T, (moe_gu_kernel<T_Q3_K, NT, true><<<grid, 256, 0, s>>>(x, hits, h_gu))); return;
+            case T_IQ2_S: SQ_MULTI_NT_SWITCH(T, (moe_gu_kernel<T_IQ2_S, NT, true><<<grid, 256, 0, s>>>(x, hits, h_gu))); return;
+            case T_IQ3_S: SQ_MULTI_NT_SWITCH(T, (moe_gu_kernel<T_IQ3_S, NT, true><<<grid, 256, 0, s>>>(x, hits, h_gu))); return;
+            case T_IQ4_XS: SQ_MULTI_NT_SWITCH(T, (moe_gu_kernel<T_IQ4_XS, NT, true><<<grid, 256, 0, s>>>(x, hits, h_gu))); return;
+        }
+    }
     switch (type) {
+        case T_Q2_K: SQ_NT_SWITCH(T, (moe_gu_kernel<T_Q2_K, NT><<<grid, 256, 0, s>>>(x, hits, h_gu))); break;
+        case T_Q3_K: SQ_NT_SWITCH(T, (moe_gu_kernel<T_Q3_K, NT><<<grid, 256, 0, s>>>(x, hits, h_gu))); break;
+        case T_IQ2_S: SQ_NT_SWITCH(T, (moe_gu_kernel<T_IQ2_S, NT><<<grid, 256, 0, s>>>(x, hits, h_gu))); break;
+        case T_IQ3_S: SQ_NT_SWITCH(T, (moe_gu_kernel<T_IQ3_S, NT><<<grid, 256, 0, s>>>(x, hits, h_gu))); break;
+        case T_IQ4_XS: SQ_NT_SWITCH(T, (moe_gu_kernel<T_IQ4_XS, NT><<<grid, 256, 0, s>>>(x, hits, h_gu))); break;
         case T_Q4_K: SQ_NT_SWITCH(T, (moe_gu_kernel<T_Q4_K, NT><<<grid, 256, 0, s>>>(x, hits, h_gu))); break;
         case T_Q5_K: SQ_NT_SWITCH(T, (moe_gu_kernel<T_Q5_K, NT><<<grid, 256, 0, s>>>(x, hits, h_gu))); break;
         case T_Q6_K: SQ_NT_SWITCH(T, (moe_gu_kernel<T_Q6_K, NT><<<grid, 256, 0, s>>>(x, hits, h_gu))); break;
@@ -1244,18 +1560,60 @@ void k_moe_gu(uint32_t type, ActQ x, const HitList* hits, float* h_gu, int T, cu
     }
 }
 
+void k_moe_gu(uint32_t type, ActQ x, const HitList* hits, float* h_gu, int T, cudaStream_t s, int known_experts) {
+    k_test_moe_gu(type, x, hits, h_gu, T, gpu_expert_reuse_enabled(), s, gpu_expert_transpose_enabled(), known_experts);
+}
+
+void k_add_expert_output(float* destination, const float* source, int elements, cudaStream_t s) {
+    add_expert_output_kernel<<<(elements + 255) / 256, 256, 0, s>>>(destination, source, elements);
+}
+
 void k_moe_act(const float* h_gu, const HitList* hits, ActQ hq, int T, cudaStream_t s) {
     moe_act_kernel<<<kMaxK * T, kFF, 0, s>>>(h_gu, hits, hq);
 }
 
-void k_moe_down(uint32_t type, int64_t down_off, ActQ hq, const HitList* hits, float* out, int T, cudaStream_t s) {
+void k_test_moe_down(uint32_t type, int64_t down_off, ActQ hq, const HitList* hits, float* out, int T, bool reuse,
+                     cudaStream_t s, bool transpose) {
     const int grid = kE / 16;
+    if (transpose) {
+#define SQ_TRANSPOSE_DOWN_CASE(Type) \
+        case Type: \
+            if (T > 1 && reuse) { SQ_MULTI_NT_SWITCH(T, (moe_down_kernel<Type, NT, true, true><<<grid, 256, 0, s>>>(down_off, hq, hits, out))); } \
+            else { SQ_NT_SWITCH(T, (moe_down_kernel<Type, NT, false, true><<<grid, 256, 0, s>>>(down_off, hq, hits, out))); } \
+            return
+        switch (type) {
+            SQ_TRANSPOSE_DOWN_CASE(T_Q2_K);
+            SQ_TRANSPOSE_DOWN_CASE(T_Q3_K);
+            SQ_TRANSPOSE_DOWN_CASE(T_IQ2_S);
+            SQ_TRANSPOSE_DOWN_CASE(T_IQ3_S);
+            SQ_TRANSPOSE_DOWN_CASE(T_IQ4_XS);
+        }
+#undef SQ_TRANSPOSE_DOWN_CASE
+    }
+    if (T > 1 && reuse) {
+        switch (type) {
+            case T_Q2_K: SQ_MULTI_NT_SWITCH(T, (moe_down_kernel<T_Q2_K, NT, true><<<grid, 256, 0, s>>>(down_off, hq, hits, out))); return;
+            case T_Q3_K: SQ_MULTI_NT_SWITCH(T, (moe_down_kernel<T_Q3_K, NT, true><<<grid, 256, 0, s>>>(down_off, hq, hits, out))); return;
+            case T_IQ2_S: SQ_MULTI_NT_SWITCH(T, (moe_down_kernel<T_IQ2_S, NT, true><<<grid, 256, 0, s>>>(down_off, hq, hits, out))); return;
+            case T_IQ3_S: SQ_MULTI_NT_SWITCH(T, (moe_down_kernel<T_IQ3_S, NT, true><<<grid, 256, 0, s>>>(down_off, hq, hits, out))); return;
+            case T_IQ4_XS: SQ_MULTI_NT_SWITCH(T, (moe_down_kernel<T_IQ4_XS, NT, true><<<grid, 256, 0, s>>>(down_off, hq, hits, out))); return;
+        }
+    }
     switch (type) {
+        case T_Q2_K: SQ_NT_SWITCH(T, (moe_down_kernel<T_Q2_K, NT><<<grid, 256, 0, s>>>(down_off, hq, hits, out))); break;
+        case T_Q3_K: SQ_NT_SWITCH(T, (moe_down_kernel<T_Q3_K, NT><<<grid, 256, 0, s>>>(down_off, hq, hits, out))); break;
+        case T_IQ2_S: SQ_NT_SWITCH(T, (moe_down_kernel<T_IQ2_S, NT><<<grid, 256, 0, s>>>(down_off, hq, hits, out))); break;
+        case T_IQ3_S: SQ_NT_SWITCH(T, (moe_down_kernel<T_IQ3_S, NT><<<grid, 256, 0, s>>>(down_off, hq, hits, out))); break;
+        case T_IQ4_XS: SQ_NT_SWITCH(T, (moe_down_kernel<T_IQ4_XS, NT><<<grid, 256, 0, s>>>(down_off, hq, hits, out))); break;
         case T_Q4_K: SQ_NT_SWITCH(T, (moe_down_kernel<T_Q4_K, NT><<<grid, 256, 0, s>>>(down_off, hq, hits, out))); break;
         case T_Q5_K: SQ_NT_SWITCH(T, (moe_down_kernel<T_Q5_K, NT><<<grid, 256, 0, s>>>(down_off, hq, hits, out))); break;
         case T_Q6_K: SQ_NT_SWITCH(T, (moe_down_kernel<T_Q6_K, NT><<<grid, 256, 0, s>>>(down_off, hq, hits, out))); break;
         default: die("moe_down: unsupported type %u", type);
     }
+}
+
+void k_moe_down(uint32_t type, int64_t down_off, ActQ hq, const HitList* hits, float* out, int T, cudaStream_t s) {
+    k_test_moe_down(type, down_off, hq, hits, out, T, gpu_expert_reuse_enabled(), s, gpu_expert_transpose_enabled());
 }
 
 void k_combine(float* x, const float* moe_gpu, const float* sh_out, const float* d_sg, const int32_t* d_nmiss,
@@ -1265,8 +1623,16 @@ void k_combine(float* x, const float* moe_gpu, const float* sh_out, const float*
 }
 
 void k_argmax(const float* logits, int n, int32_t* out_dev, int T, cudaStream_t s, float* prob_dev) {
-    argmax_stage1<<<dim3(kArgmaxBlocks, T), 256, 0, s>>>(logits, n);
-    argmax_stage2<<<T, 256, 0, s>>>(out_dev, prob_dev);
+    // Trunk verification and ordinary greedy sampling need only an index. Keep the probability path's
+    // strict comparisons, lower-id tie break, and sentinel for rows containing only NaN/-infinity.
+    // MTP confidence still uses the original online softmax arithmetic when a probability is requested.
+    if (prob_dev) {
+        argmax_stage1<true><<<dim3(kArgmaxBlocks, T), 256, 0, s>>>(logits, n);
+        argmax_stage2<true><<<T, 256, 0, s>>>(out_dev, prob_dev);
+    } else {
+        argmax_stage1<false><<<dim3(kArgmaxBlocks, T), 256, 0, s>>>(logits, n);
+        argmax_stage2<false><<<T, 256, 0, s>>>(out_dev, nullptr);
+    }
 }
 
 void k_candidates(const float* logits, int n, const uint32_t* counts, SamplePen pen, float* tmp, Candidates* out_dev,

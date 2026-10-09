@@ -837,6 +837,7 @@ class WebApp(unittest.TestCase):
         self.assertEqual(m["engine"]["max_context"], CTX)
         self.assertEqual(m["live"]["state"], "idle")
         self.assertEqual(m["requests"][0]["output_tokens"], 5)
+        self.assertIn("prefill_tok_s", m["requests"][0])
 
     def test_model_discovery_and_props(self):
         svc = self.svc
@@ -985,6 +986,9 @@ class UsageAndStatus(unittest.TestCase):
         self.assertEqual(t["predicted_n"], u["completion_tokens"])
         self.assertAlmostEqual(t["prompt_per_second"], t["prompt_n"] / 0.040, delta=0.1)
         self.assertAlmostEqual(t["predicted_per_second"], 50.0, delta=0.1)            # 20 ms a token
+        recent = self.svc.metrics()["requests"][0]
+        self.assertEqual(recent["prefill_tok_s"], t["prompt_per_second"])
+        self.assertEqual(recent["decode_tok_s"], t["predicted_per_second"])
 
     def test_openai_stream(self):
         last = self.chat("/v1/chat/completions", stream=True)[-1]

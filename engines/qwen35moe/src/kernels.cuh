@@ -80,14 +80,22 @@ void k_mtp_in(const StepParams* P, const float* h, const float* enorm, const flo
 
 // ---- GEMV (weights read once for all T tokens)
 void k_gemv_q8(const DQ8& W, ActQ a, float* y, int T, cudaStream_t s);
+// Explicit load selection for parity tests; original Q6 dispatch is unchanged.
+void k_test_gemv_q8(const DQ8& W, ActQ a, float* y, int T, bool readonly, cudaStream_t s);
 void k_gemv_f32(const DF32& W, const float* x, float* y, int T, cudaStream_t s);
 
 // ---- gated delta net: the T tokens are scanned in order.  With `snap` set, the conv / recurrent state after each
 // token but the last is also written to snap + t * snap_stride (floats), for rolling back rejected drafts.
 void k_gdn_conv(const float* qkvz, float* conv_state, const float* conv_w, float* conv_out, int T, float* snap,
                 int64_t snap_stride, cudaStream_t s);
+// Cached strict opt-in setting. The engine may select only prompt calls by passing scratch there.
+bool gdn_prepare_enabled();
+constexpr size_t gdn_prepare_floats(int tokens) { return (size_t)tokens * 32 * 4; }
+// Null scratch retains the original kernel. Nonnull scratch needs gdn_prepare_floats(T)
+// floats, 16-byte alignment, no alias with other buffers, and stream-ordered lifetime.
+// Explicit pointer selection also permits old/prepared parity in one process.
 void k_gdn_recur(const float* conv_out, const float* ba, const float* dt_bias, const float* ssm_a, float* state,
-                 float* o, int T, float* snap, int64_t snap_stride, cudaStream_t s);
+                 float* o, int T, float* snap, int64_t snap_stride, cudaStream_t s, float* prepared_factors = nullptr);
 void k_gdn_norm_gate(const float* o, const float* qkvz, const float* norm_w, float eps, ActQ yq, int T, cudaStream_t s);
 
 // ---- gated attention
@@ -96,19 +104,40 @@ void k_attn_prep(const float* qkv, const float* q_norm, const float* k_norm, flo
 int attn_max_splits(int max_ctx);
 void k_attn_decode(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, const StepParams* P, int max_ctx,
                    float* part_o, float* part_ml, int T, cudaStream_t s);
+// Optional INT8 KV: caches have [2,max_ctx,256] signed bytes; scales are [2,max_ctx]
+// FP32, one per head/token. Causal masks, query layout and split outputs match FP16.
+void k_attn_prep_i8(const float* qkv, const float* q_norm, const float* k_norm, float eps, const StepParams* P,
+                    float rope_base, float* q_out, int8_t* k_cache, int8_t* v_cache,
+                    float* k_scales, float* v_scales, int max_ctx, int T, cudaStream_t s);
+void k_attn_decode_i8(const float* q, const int8_t* k_cache, const int8_t* v_cache,
+                      const float* k_scales, const float* v_scales, const StepParams* P, int max_ctx,
+                      float* part_o, float* part_ml, int T, cudaStream_t s);
 void k_attn_combine(const float* part_o, const float* part_ml, const float* qkv, const StepParams* P, int max_ctx,
                     ActQ oq, int T, cudaStream_t s);
 
 // ---- MoE
 /// Top-8 routing per token; distinct experts split into resident (HitList) and missing (mailbox for the CPU).
-/// ecount[0] / [1] accumulate the resident / missing distinct experts (hit-rate statistics).
+/// ecount[0] / [1] accumulate resident / missing (expert, token) routes, comparable for T=1..4.
 void k_router(const float* logits, int layer, const int32_t* residency, const CacheLayerInfo* cinfo, const float* xn,
               HitList* hits, Mailbox* mb_dev, const StepParams* P, int32_t* d_nmiss, float* d_sg, uint32_t* counts,
-              unsigned long long* ecount, int T, cudaStream_t s);
+              unsigned long long* ecount, int T, cudaStream_t s, bool device_mailbox = false);
+/// Explicit parity-test selection. omit_system_fence=true requires a device mailbox consumed after kernel completion.
+/// Production STRATA_ROUTER_DEVICE_FENCE=1 permits this only when device_mailbox=true; mapped polling stays fenced.
+void k_test_router(const float* logits, int layer, const int32_t* residency, const CacheLayerInfo* cinfo, const float* xn,
+                   HitList* hits, Mailbox* mb_dev, const StepParams* P, int32_t* d_nmiss, float* d_sg, uint32_t* counts,
+                   unsigned long long* ecount, int T, cudaStream_t s, bool omit_system_fence);
 void k_swiglu_q(const float* gu, ActQ out, int n_ff, int T, cudaStream_t s);   // out = quant(silu(g) * u), gu = [g | u]
-void k_moe_gu(uint32_t type, ActQ x, const HitList* hits, float* h_gu, int T, cudaStream_t s);
+// known_experts=0 keeps the original 8*T launch; a positive host-validated HitList::n removes empty CTAs only.
+void k_moe_gu(uint32_t type, ActQ x, const HitList* hits, float* h_gu, int T, cudaStream_t s, int known_experts = 0);
+// Combine separately computed resident and transient GPU expert sums before the ordinary CPU/shared combine.
+void k_add_expert_output(float* destination, const float* source, int elements, cudaStream_t s);
+// Explicit selection for full-kernel parity tests; normal callers use the stable process-level opt-in above.
+void k_test_moe_gu(uint32_t type, ActQ x, const HitList* hits, float* h_gu, int T, bool reuse, cudaStream_t s,
+                    bool transpose = false, int known_experts = 0);
 void k_moe_act(const float* h_gu, const HitList* hits, ActQ hq, int T, cudaStream_t s);
 void k_moe_down(uint32_t type, int64_t down_off, ActQ hq, const HitList* hits, float* out, int T, cudaStream_t s);
+void k_test_moe_down(uint32_t type, int64_t down_off, ActQ hq, const HitList* hits, float* out, int T, bool reuse,
+                      cudaStream_t s, bool transpose = false);
 /// x += moe_gpu + moe_cpu (after waiting for it) + sigmoid(sg) * shared; then the next norm.
 /// wait_ns accumulates the time the GPU spent waiting for the CPU experts (globaltimer ns).
 void k_combine(float* x, const float* moe_gpu, const float* sh_out, const float* d_sg, const int32_t* d_nmiss,

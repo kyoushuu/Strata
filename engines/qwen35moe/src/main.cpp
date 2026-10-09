@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
@@ -41,6 +42,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -49,6 +51,9 @@
 
 #ifndef SQ_VERSION
 #define SQ_VERSION "0.0.0"
+#endif
+#ifndef SQ_ENGINE_TAG
+#define SQ_ENGINE_TAG "qwen35moe"
 #endif
 
 using namespace sq;
@@ -80,9 +85,10 @@ void usage() {
         "  --no-graph         launch kernels one by one (debug)\n"
         "  --no-adapt         keep the expert cache fixed\n"
         "  --adapt-every N --adapt-swaps M   re-rank the cache every N tokens, swapping up to M experts\n"
+        "  --adapt-decay D   routing-frequency retention per adaptation, 0 <= D < 1 (default 0.97)\n"
         "  --profile-weight W weight of the profile against live routing (default 1)\n"
-        "  --prefill-chunk N  tokens per prefill pass (default 4096; smaller leaves more VRAM for experts)\n"
-        "  --ckpt-slots N     prefix-reuse checkpoints (default 3, ~66 MiB of VRAM each)\n"
+        "  --prefill-chunk N  tokens per prefill pass (default 4096; 0 = decode-only, saves VRAM)\n"
+        "  --ckpt-slots N     prefix-reuse checkpoints (default 3, ~66 MiB each; 0 = disabled)\n"
         "  --mtp-draft N      speculative decoding: up to N tokens drafted per step by the MTP block (default 3,\n"
         "                     max 3; 0 = off and the MTP block is not loaded; also --mtp)\n"
         "  --draft-p P        keep drafting while the MTP's probability of the drafts so far is >= P (default 0.8)\n"
@@ -92,6 +98,10 @@ void usage() {
         "  --dump-logits F    write the logits after --ids to F (float32)\n"
         "  --bench [--bench-prompt N] [-n N]\n"
         "  --selfcheck N      logits of a random N-token prompt: batched prefill vs prefill(N-1) + decode(1)\n"
+        "  --selfcheck-layer-major N  chunk/layer-major parity, continuation, prefix reuse and MTP rollback;\n"
+        "                     N >= 16; forces deferred MMQ prefill, no adaptation, >=1 checkpoint; fails if KL > .01\n"
+        "                     STRATA_LAYER_PARITY_REFERENCE_CHUNK overrides reference chunk size;\n"
+        "                     STRATA_LAYER_PARITY_CONTROL=1 compares two chunk-major paths instead\n"
         "  --spec-check       with --ids: greedy generation with MTP drafts vs without, token by token\n"
         "  --serve            Strata's engine protocol on stdin/stdout\n");
 }
@@ -179,10 +189,10 @@ int serve(Engine& eng, const ServeOptions& so) {
     log("strata-qwen35moe: expert cache %lld slots, %.2f GiB; %lld MiB of VRAM free with everything loaded",
         (long long)eng.cache_slots(), eng.cache_gib(), (long long)(free_b >> 20));
     log("strata-qwen35moe: session is up");
-    emit("INFO context=%d kv=fp16 kv_resident=0 expert_slots=%lld expert_cache_mib=%lld expert_slots_primary=%lld "
+    emit("INFO context=%d kv=%s kv_resident=0 kv_mib=%lld expert_slots=%lld expert_cache_mib=%lld expert_slots_primary=%lld "
          "expert_cache_primary_mib=%lld spec=%d mtp_max=%d lookup=0 vram_free_mib=%lld arena_mib=%lld pool_workers=%d "
-         "conversation_cache_slots=%d engine=" SQ_VERSION "+qwen35moe",
-         ctx, (long long)eng.cache_slots(), (long long)(eng.cache_gib() * 1024), (long long)eng.cache_slots(),
+         "conversation_cache_slots=%d engine=" SQ_VERSION "+" SQ_ENGINE_TAG,
+         ctx, eng.kv_type(), (long long)(eng.kv_bytes() >> 20), (long long)eng.cache_slots(), (long long)(eng.cache_gib() * 1024), (long long)eng.cache_slots(),
          (long long)(eng.cache_gib() * 1024), eng.mtp_draft() + 1, eng.mtp_draft() + 1, (long long)(free_b >> 20),
          (long long)(eng.expert_arena_bytes() >> 20), eng.cpu_threads(), eng.ckpt_slots());
     emit("READY %d stop", ctx);
@@ -221,6 +231,8 @@ int serve(Engine& eng, const ServeOptions& so) {
         uint64_t hits0 = 0, miss0 = 0;
         eng.expert_counts(hits0, miss0);
         const uint64_t acc0 = eng.stats.accepted, off0 = eng.stats.drafted;
+        const uint64_t swaps0 = eng.stats.swaps;
+        const double adapt_ms0 = eng.stats.adapt_ms;
 
         // ---- the prompt: what a checkpoint or the live state already holds, then the rest in slices
         const auto t0 = Clock::now();
@@ -250,6 +262,10 @@ int serve(Engine& eng, const ServeOptions& so) {
             emit("PP %d %d %.0f %.1f", pos, n, ms, ms > 0 ? 1000.0 * (pos - reused) / ms : 0.0);
         }
         if (reused < n) eng.save_checkpoint();
+        uint64_t hits_after_prompt = 0, miss_after_prompt = 0;
+        eng.expert_counts(hits_after_prompt, miss_after_prompt);
+        const uint64_t swaps_after_prompt = eng.stats.swaps;
+        const double adapt_ms_after_prompt = eng.stats.adapt_ms;
         const auto t1 = Clock::now();
 
         // ---- the answer: each round emits the tokens after the last one emitted (one sampled token, or with MTP the
@@ -267,7 +283,7 @@ int serve(Engine& eng, const ServeOptions& so) {
             }
             if (done) break;
             if (stop_req.load()) { finish = "cancel"; break; }
-            eng.spec_step(next.back(), sp, rng, next);
+            eng.spec_step(next.back(), sp, rng, next, &so.eos, (int)(max_new - produced));
         }
         const auto t2 = Clock::now();
         const double prompt_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -284,6 +300,16 @@ int serve(Engine& eng, const ServeOptions& so) {
             prompt_ms > 0 ? 1000.0 * (n - reused) / prompt_ms : 0.0, produced, decode_ms,
             decode_ms > 0 ? 1000.0 * produced / decode_ms : 0.0, (unsigned long long)(eng.stats.accepted - acc0),
             (unsigned long long)(eng.stats.drafted - off0), std::strcmp(finish, "cancel") == 0 ? " (cancelled)" : "");
+        const uint64_t prompt_hits = hits_after_prompt - hits0, prompt_miss = miss_after_prompt - miss0;
+        const uint64_t decode_hits = hits - prompt_hits, decode_miss = miss - prompt_miss;
+        const auto hit_percent = [](uint64_t h, uint64_t m) { return h + m > 0 ? 100.0 * h / (h + m) : 0.0; };
+        log("strata-qwen35moe: expert cache prompt %llu/%llu hits (%.2f%%), decode %llu/%llu hits (%.2f%%); "
+            "swaps prompt %llu in %.3f ms, decode %llu in %.3f ms",
+            (unsigned long long)prompt_hits, (unsigned long long)(prompt_hits + prompt_miss),
+            hit_percent(prompt_hits, prompt_miss), (unsigned long long)decode_hits,
+            (unsigned long long)(decode_hits + decode_miss), hit_percent(decode_hits, decode_miss),
+            (unsigned long long)(swaps_after_prompt - swaps0), adapt_ms_after_prompt - adapt_ms0,
+            (unsigned long long)(eng.stats.swaps - swaps_after_prompt), eng.stats.adapt_ms - adapt_ms_after_prompt);
         if (Clock::now() - last_save > std::chrono::seconds(60)) {
             save_profile();
             last_save = Clock::now();
@@ -293,6 +319,193 @@ int serve(Engine& eng, const ServeOptions& so) {
     return 0;
 }
 
+void check_set_env(const char* name, const char* value) {
+#ifdef _WIN32
+    SQ_CHECK(_putenv_s(name, value) == 0, "cannot set %s for layer-major selfcheck", name);
+#else
+    SQ_CHECK(setenv(name, value, 1) == 0, "cannot set %s for layer-major selfcheck", name);
+#endif
+}
+
+bool compare_layer_major_logits(const std::vector<float>& ref, const std::vector<float>& actual,
+                                const std::string& stage) {
+    if (ref.empty() || ref.size() != actual.size()) {
+        std::printf("layer-major parity %s: FAIL (logit dimensions %zu / %zu)\n", stage.c_str(),
+                    ref.size(), actual.size());
+        return false;
+    }
+    double mr = -INFINITY, ma = -INFINITY, sr = 0, sa = 0;
+    size_t ar = 0, aa = 0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        if (!std::isfinite(ref[i]) || !std::isfinite(actual[i])) {
+            std::printf("layer-major parity %s: FAIL (nonfinite logit at %zu)\n", stage.c_str(), i);
+            return false;
+        }
+        mr = std::max(mr, (double)ref[i]);
+        ma = std::max(ma, (double)actual[i]);
+        if (ref[i] > ref[ar]) ar = i;
+        if (actual[i] > actual[aa]) aa = i;
+    }
+    for (size_t i = 0; i < ref.size(); ++i) {
+        sr += std::exp(ref[i] - mr);
+        sa += std::exp(actual[i] - ma);
+    }
+    const double lr_sum = std::log(sr), la_sum = std::log(sa);
+    double kl = 0, max_logit = 0, max_active_logp = 0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const double lr = ref[i] - mr - lr_sum, la = actual[i] - ma - la_sum;
+        kl += std::exp(lr) * (lr - la);
+        max_logit = std::max(max_logit, std::abs((double)ref[i] - actual[i]));
+        if (lr > -10.0) max_active_logp = std::max(max_active_logp, std::abs(lr - la));
+    }
+    // The existing decode-vs-prefill check includes quantized arithmetic differences. Do not mistake a close
+    // argmax tie for a failure; report it together with a distribution-wide, explicit numerical gate.
+    const bool ok = std::isfinite(kl) && std::isfinite(max_logit) && std::isfinite(max_active_logp) && kl <= 0.01;
+    std::printf("layer-major parity %s: KL %.9g max_dlogit %.9g active_dlogp %.9g argmax %zu/%zu %s\n",
+                stage.c_str(), kl, max_logit, max_active_logp, ar, aa, ok ? "PASS" : "FAIL");
+    std::fflush(stdout);
+    return ok;
+}
+
+int selfcheck_layer_major(Engine& eng, int n) {
+    constexpr int prefix = 17, continuation = 8;
+    const int configured_chunk = eng.debug_prefill_chunk();
+    int reference_chunk = configured_chunk;
+    if (const char* value = std::getenv("STRATA_LAYER_PARITY_REFERENCE_CHUNK")) {
+        size_t used = 0;
+        try { reference_chunk = std::stoi(value, &used); }
+        catch (const std::exception&) { die("STRATA_LAYER_PARITY_REFERENCE_CHUNK requires a positive integer"); }
+        SQ_CHECK(reference_chunk > 0 && used == std::strlen(value),
+                 "STRATA_LAYER_PARITY_REFERENCE_CHUNK requires a positive integer");
+    }
+    bool chunk_control = false;
+    if (const char* value = std::getenv("STRATA_LAYER_PARITY_CONTROL")) {
+        SQ_CHECK(std::strcmp(value, "0") == 0 || std::strcmp(value, "1") == 0,
+                 "STRATA_LAYER_PARITY_CONTROL requires 0 or 1");
+        chunk_control = std::strcmp(value, "1") == 0;
+    }
+    const int T = eng.mtp() ? eng.mtp_draft() + 1 : 0;
+    const int extra = continuation + (T > 1 ? T + 2 : 0);
+    SQ_CHECK((int64_t)n + prefix + extra <= eng.ctx(),
+             "layer-major selfcheck needs context >= N + %d (%lld tokens)", prefix + extra,
+             (long long)n + prefix + extra);
+    SQ_CHECK(eng.ckpt_slots() > 0, "layer-major selfcheck needs a checkpoint for prefix restoration");
+    const int range = std::min(50000, eng.cfg().n_vocab - 1000);
+    SQ_CHECK(range > 0, "model vocabulary is too small for layer-major selfcheck");
+    std::mt19937 rng(7);
+    std::vector<int> tokens((size_t)n + prefix + extra);
+    for (int& token : tokens) token = 1000 + (int)(rng() % range);
+    // Growth itself is tested separately. Reserving once keeps pointer/capacity changes out of this comparison.
+    eng.debug_reserve_kv((int)tokens.size());
+    eng.debug_freeze_cache_adaptation();
+    std::printf("layer-major selfcheck: seed 7, N %d, forced continuation %d, MTP window %d, KL limit .01\n",
+                n, continuation, T);
+    std::printf("parity implementations: reference chunk-major %d, candidate %s %d\n", reference_chunk,
+                chunk_control ? "chunk-major" : "layer-major (configured chunk)", configured_chunk);
+    bool ok = true;
+    struct Row { std::string stage; std::vector<float> logits; };
+    for (bool cached : {false, true}) {
+        const std::string fixture = std::string(chunk_control ? "chunk-control/" : "") +
+                                    (cached ? "restored-prefix" : "cold");
+        const int prompt_end = n + (cached ? prefix : 0);
+        std::vector<Row> reference;
+        auto run = [&](bool candidate) {
+            const char* mode = candidate ? (chunk_control ? "candidate-chunk" : "layer") : "reference-chunk";
+            eng.reset();
+            check_set_env("STRATA_PREFILL_LAYER_MAJOR", "0");
+            if (cached) {
+                // Both modes begin with the same known-good prefix. Force a divergent suffix so reuse_prefix
+                // must restore a saved recurrent/MTP checkpoint instead of merely returning the live position.
+                eng.feed(tokens.data(), prefix);
+                eng.save_checkpoint();
+                const int other = (tokens[prefix] + 1) % eng.cfg().n_vocab;
+                eng.feed(&other, 1);
+                const std::vector<int> prompt(tokens.begin(), tokens.begin() + prompt_end);
+                const int reused = eng.reuse_prefix(prompt);
+                if (reused != prefix) {
+                    std::printf("layer-major parity %s/%s: FAIL (prefix reused %d, expected %d)\n",
+                                fixture.c_str(), mode, reused, prefix);
+                    ok = false;
+                    return;
+                }
+            }
+            check_set_env("STRATA_PREFILL_LAYER_MAJOR", candidate && !chunk_control ? "1" : "0");
+            const int prior_chunk = eng.debug_set_prefill_chunk(candidate ? configured_chunk : reference_chunk);
+            eng.feed(tokens.data() + (cached ? prefix : 0), n);
+            eng.debug_set_prefill_chunk(prior_chunk);
+            auto state = [&](int expected) {
+                if (eng.n_past() != expected || eng.tokens().size() != (size_t)expected ||
+                    !std::equal(eng.tokens().begin(), eng.tokens().end(), tokens.begin())) {
+                    std::printf("layer-major parity %s/%s: FAIL (history at %d, expected %d)\n",
+                                fixture.c_str(), mode, eng.n_past(), expected);
+                    ok = false;
+                }
+            };
+            size_t row = 0;
+            auto record = [&](const std::string& label, std::vector<float> logits) {
+                const std::string stage = fixture + "/" + label;
+                if (!candidate) {
+                    if (logits.empty() || !std::all_of(logits.begin(), logits.end(),
+                                                     [](float x) { return std::isfinite(x); })) {
+                        std::printf("layer-major parity %s: FAIL (nonfinite/empty reference)\n", stage.c_str());
+                        ok = false;
+                    }
+                    reference.push_back(Row{stage, std::move(logits)});
+                } else if (row >= reference.size() || reference[row].stage != stage) {
+                    std::printf("layer-major parity %s: FAIL (missing reference row)\n", stage.c_str());
+                    ok = false;
+                } else {
+                    ok = compare_layer_major_logits(reference[row].logits, logits, stage) && ok;
+                }
+                ++row;
+            };
+            state(prompt_end);
+            record("prompt", eng.logits_host());
+            // Target verification alone does not depend on the MTP logits. Check the actual draft distribution
+            // too, so an incorrect MTP prefill/KV state cannot hide behind correct target-model continuation.
+            if (T > 1) record("mtp-draft-after-prompt", eng.debug_mtp_catch_up(tokens[prompt_end], true));
+            for (int j = 0; j < continuation; ++j) {
+                eng.feed(tokens.data() + prompt_end + j, 1);
+                state(prompt_end + j + 1);
+                record("continuation-" + std::to_string(j + 1), eng.logits_host());
+            }
+            if (T > 1) {
+                const int at = prompt_end + continuation;
+                const size_t vocab = eng.cfg().n_vocab;
+                auto rows = [&](const std::vector<float>& logits, const char* label) {
+                    if (logits.size() != vocab * T) {
+                        std::printf("layer-major parity %s/%s: FAIL (verification dimensions)\n",
+                                    fixture.c_str(), label);
+                        ok = false;
+                        return;
+                    }
+                    for (int t = 0; t < T; ++t)
+                        record(std::string(label) + "-" + std::to_string(t),
+                               std::vector<float>(logits.begin() + t * vocab, logits.begin() + (t + 1) * vocab));
+                };
+                rows(eng.debug_verify(tokens.data() + at, T, 1), "verify-keep1");
+                state(at + 1);
+                rows(eng.debug_verify(tokens.data() + at + 1, T, T), "after-rollback");
+                state(at + 1 + T);
+                eng.feed(tokens.data() + at + 1 + T, 1);
+                state(at + 2 + T);
+                record("after-rollback-single", eng.logits_host());
+            }
+            if (candidate && row != reference.size()) {
+                std::printf("layer-major parity %s: FAIL (row count %zu / %zu)\n",
+                            fixture.c_str(), row, reference.size());
+                ok = false;
+            }
+        };
+        run(false);
+        run(true);
+    }
+    check_set_env("STRATA_PREFILL_LAYER_MAJOR", "0");
+    if (chunk_control) std::puts(ok ? "CHUNK-CONTROL PARITY PASS" : "CHUNK-CONTROL PARITY FAIL");
+    else std::puts(ok ? "LAYER-MAJOR PARITY PASS" : "LAYER-MAJOR PARITY FAIL");
+    return ok ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -300,8 +513,8 @@ int main(int argc, char** argv) {
     opt.profile_path = "data/expert-profile-qwen36.bin";
     ServeOptions so;
     std::string ids_s, dump_logits;
-    int n_gen = 32, bench_prompt = 512, selfcheck = 0;
-    bool do_serve = false, do_bench = false, spec_check = false;
+    int n_gen = 32, bench_prompt = 512, selfcheck = 0, layer_major_check = 0;
+    bool do_serve = false, do_bench = false, spec_check = false, layer_major_requested = false;
     SamplingParams sp;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -323,6 +536,13 @@ int main(int argc, char** argv) {
         else if (a == "--profile-weight") opt.profile_weight = std::stod(next());
         else if (a == "--adapt-every") opt.adapt_every = std::stoi(next());
         else if (a == "--adapt-swaps") opt.adapt_swaps = std::stoi(next());
+        else if (a == "--adapt-decay") {
+            const std::string value = next();
+            size_t used = 0;
+            try { opt.adapt_decay = std::stod(value, &used); }
+            catch (const std::exception&) { die("--adapt-decay requires a floating-point value with 0 <= decay < 1"); }
+            SQ_CHECK(used == value.size(), "--adapt-decay requires a floating-point value with 0 <= decay < 1");
+        }
         else if (a == "--prefill-chunk") opt.prefill_chunk = std::stoi(next());
         else if (a == "--no-pin") opt.pin_threads = false;
         else if (a == "--mtp" || a == "--mtp-draft") opt.mtp_draft = std::stoi(next());
@@ -336,6 +556,10 @@ int main(int argc, char** argv) {
         else if (a == "--bench") do_bench = true;
         else if (a == "--bench-prompt") bench_prompt = std::stoi(next());
         else if (a == "--selfcheck") selfcheck = std::stoi(next());
+        else if (a == "--selfcheck-layer-major") {
+            layer_major_check = std::stoi(next());
+            layer_major_requested = true;
+        }
         else if (a == "--temp") sp.temperature = std::stof(next());
         else if (a == "--top-k") sp.top_k = std::stoi(next());
         else if (a == "--top-p") sp.top_p = std::stof(next());
@@ -345,10 +569,30 @@ int main(int argc, char** argv) {
         else { usage(); die("unknown option %s", a.c_str()); }
     }
     if (opt.model_path.empty()) { usage(); return 1; }
+    if (layer_major_requested) {
+        SQ_CHECK(layer_major_check >= 16, "--selfcheck-layer-major requires N >= 16");
+        SQ_CHECK(!do_serve && !do_bench && !spec_check && selfcheck == 0 && ids_s.empty(),
+                 "--selfcheck-layer-major is a standalone check");
+        SQ_CHECK(opt.prefill_chunk > 0, "--selfcheck-layer-major requires --prefill-chunk > 0");
+        const char* int8_kv = std::getenv("STRATA_KV_INT8");
+        SQ_CHECK(!int8_kv || std::atoi(int8_kv) == 0,
+                 "--selfcheck-layer-major requires FP16 KV (STRATA_KV_INT8=0)");
+        // Prefill is created within each feed and destroyed afterwards, so changing layer-major between the
+        // reference and candidate genuinely switches implementations without loading two models into VRAM.
+        check_set_env("STRATA_PREFILL_PHASE_SWITCH", "1");
+        check_set_env("STRATA_PREFILL_PHASE_MIN", "8");
+        check_set_env("STRATA_PREFILL_MMQ", "1");
+        check_set_env("STRATA_PREFILL_LAYER_MAJOR", "0");
+        opt.prefill_min = 8;
+        opt.adapt_every = 0;
+        opt.use_graph = false;
+        opt.ckpt_slots = std::max(opt.ckpt_slots, 1);
+    }
     if (!so.profile_save.empty() && std::ifstream(so.profile_save).good()) opt.profile_path = so.profile_save;
     Engine eng;
     std::string err;
     if (!eng.init(opt, err)) die("%s", err.c_str());
+    if (layer_major_requested) return selfcheck_layer_major(eng, layer_major_check);
     if (do_serve) return serve(eng, so);
     if (selfcheck > 1) {
         std::mt19937 rng(7);

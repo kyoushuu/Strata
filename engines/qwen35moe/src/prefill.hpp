@@ -21,6 +21,12 @@ public:
 private:
     /// One decoder layer (attention or delta net, then MoE) over the T rows of X at positions p0 .. p0+T-1.
     void layer(int il, int T, int p0);
+    /// Long-prompt layer-major path: one layer traverses a bounded window of prompt tiles before the next layer.
+    void run_layer_major(const int* tokens, int n);
+    /// A window of the original prompt; explicit offsets preserve positions and MTP pairs across windows.
+    void run_layer_major_window(const int* tokens, int total_n, int window_start, int n, bool ordered_combine);
+    /// Mixer half using both expanded dense matrices prepared once for the whole layer.
+    void mixer_prepared(int il, int T, int p0);
     /// The MTP pass after a chunk of T tokens (chunk offset `done` in tokens[0..n), first position p0).
     void mtp(const int* tokens, int n, int done, int T, int p0);
 

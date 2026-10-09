@@ -165,11 +165,19 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
     kwargs.update(effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort")))
     # the vLLM / llama.cpp convention: {"chat_template_kwargs": {"enable_thinking": false, "reasoning_effort": "low"}}
-    for k, v in (req.get("chat_template_kwargs") or {}).items():
+    template_kwargs = req.get("chat_template_kwargs") or {}
+    for k, v in template_kwargs.items():
         if k == "enable_thinking" and not v:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
+    # Qwen's template can retain earlier reasoning wrappers so an extended conversation keeps the live
+    # token prefix. This is explicitly opt-in; append after enable_thinking's reset so key order cannot drop it.
+    if "preserve_thinking" in template_kwargs:
+        preserve = template_kwargs["preserve_thinking"]
+        if not isinstance(preserve, bool):
+            raise ValueError("chat_template_kwargs.preserve_thinking must be a boolean")
+        kwargs["preserve_thinking"] = preserve
     return _late_system_to_user(messages), tools, kwargs
 
 

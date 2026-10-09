@@ -9,11 +9,15 @@
 
 #include <immintrin.h>
 
+#include <cstdlib>
 #include <cstring>
+#include <cstdlib>
 
 namespace sq::avx2 {
 
-void quantize_q8k(const float* x, Q8K* y, int n) {
+namespace {
+template <bool VectorPack>
+void quantize_q8k_impl(const float* x, Q8K* y, int n) {
     for (int i = 0; i < n / 256; ++i) {
         const float* xb = x + i * 256;
         Q8K& b = y[i];
@@ -33,14 +37,37 @@ void quantize_q8k(const float* x, Q8K* y, int n) {
         alignas(32) int32_t q[256];
         for (int k = 0; k < 32; ++k)
             _mm256_store_si256((__m256i*)(q + 8 * k), _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xb + 8 * k), id)));
-        for (int k = 0; k < 16; ++k) {
-            int s = 0;
-            for (int j = 0; j < 16; ++j) {
-                const int v = q[16 * k + j] > 127 ? 127 : q[16 * k + j] < -128 ? -128 : q[16 * k + j];
-                b.nat[16 * k + j] = (int8_t)v;
-                s += v;
+        if constexpr (VectorPack) {
+            const __m256i order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+            const __m256i ones8 = _mm256_set1_epi8(1), ones16 = _mm256_set1_epi16(1);
+            for (int k = 0; k < 8; ++k) {
+                const __m256i q0 = _mm256_load_si256((const __m256i*)(q + 32 * k));
+                const __m256i q1 = _mm256_load_si256((const __m256i*)(q + 32 * k + 8));
+                const __m256i q2 = _mm256_load_si256((const __m256i*)(q + 32 * k + 16));
+                const __m256i q3 = _mm256_load_si256((const __m256i*)(q + 32 * k + 24));
+                // Two signed saturating packs implement the original clamp[-128,127] for every int32,
+                // including INT_MIN from an invalid FP conversion. Restore natural order across 128-bit lanes.
+                const __m256i bytes = _mm256_permutevar8x32_epi32(
+                    _mm256_packs_epi16(_mm256_packs_epi32(q0, q1), _mm256_packs_epi32(q2, q3)), order);
+                _mm256_storeu_si256((__m256i*)(b.nat + 32 * k), bytes);
+                // Pair sums cannot saturate: each is in [-256,254]. Reduce each independent 16-byte half.
+                const __m256i sum4 = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, bytes), ones16);
+                __m128i sums = _mm_hadd_epi32(_mm256_castsi256_si128(sum4), _mm256_extracti128_si256(sum4, 1));
+                sums = _mm_hadd_epi32(sums, sums);
+                const __m128i sum16 = _mm_packs_epi32(sums, sums);
+                const int packed_sums = _mm_cvtsi128_si32(sum16);
+                std::memcpy(b.bsums + 2 * k, &packed_sums, sizeof(packed_sums));
             }
-            b.bsums[k] = (int16_t)s;
+        } else {
+            for (int k = 0; k < 16; ++k) {
+                int s = 0;
+                for (int j = 0; j < 16; ++j) {
+                    const int v = q[16 * k + j] > 127 ? 127 : q[16 * k + j] < -128 ? -128 : q[16 * k + j];
+                    b.nat[16 * k + j] = (int8_t)v;
+                    s += v;
+                }
+                b.bsums[k] = (int16_t)s;
+            }
         }
         for (int h = 0; h < 2; ++h) {
             const int8_t* s = b.nat + 128 * h;
@@ -52,6 +79,20 @@ void quantize_q8k(const float* x, Q8K* y, int n) {
         }
         b.d = amax / 127.0f;
     }
+}
+} // namespace
+
+void quantize_q8k_test_pack(const float* x, Q8K* y, int n, bool vector_pack) {
+    if (vector_pack) quantize_q8k_impl<true>(x, y, n);
+    else quantize_q8k_impl<false>(x, y, n);
+}
+
+void quantize_q8k(const float* x, Q8K* y, int n) {
+    static const bool vector_pack = [] {
+        const char* setting = std::getenv("STRATA_Q8K_VECTOR_PACK");
+        return setting && setting[0] == '1' && setting[1] == '\0';
+    }();
+    quantize_q8k_test_pack(x, y, n, vector_pack);
 }
 
 namespace {

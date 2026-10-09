@@ -50,10 +50,13 @@ struct Config {
 
 /// A Q8_0 matrix repacked for the GPU: `qs` is rows x cols int8 (row-major, 16-byte aligned rows), `d` is
 /// rows x cols/32 fp16 scales.  Two arrays instead of 34-byte blocks so every load is 16-byte aligned.
+/// Optional native Q6_K: q6 is nonnull and qs/d are null; bytes are original blocks or lossless row planes.
 struct DQ8 {
     const int8_t* qs = nullptr;
     const uint16_t* d = nullptr;
     int rows = 0, cols = 0;
+    const uint8_t* q6 = nullptr;
+    bool q6_row_planes = false; // lossless word-plane layout; rows padded to 32 bytes, original scales unchanged
 };
 
 struct DF32 {
@@ -87,7 +90,8 @@ struct LayerW {
     int64_t gu_bytes = 0;                   // bytes of ONE of gate/up (512 rows)
     int64_t down_bytes = 0;                 // bytes of down (2048 rows)
     int64_t blob_bytes = 0;                 // gate + up + down
-    uint8_t* experts = nullptr;             // pinned host, n_expert * blob_bytes
+    uint8_t* experts = nullptr;             // pinned host or pageable file mapping, n_expert * blob_bytes
+    bool experts_pinned = false;           // true only for this model's successful cudaHostAlloc allocation
     const uint8_t* expert_blob(int e) const { return experts + (int64_t)e * blob_bytes; }
 };
 
@@ -106,6 +110,10 @@ public:
     MtpW mtp;
     const float* output_norm = nullptr;
     DQ8 lm_head;
+    bool cpu_lm_head = false;  // opt-in: lm_head's Q8 SoA pointers address host RAM
+    bool phase_lm_head = false; // keep a host Q8 copy and lend the GPU head allocation during long prefill
+    bool native_dense_q6 = false; // opt-in GPU-only packed dense Q6; requires decode-path prompts
+    bool native_dense_q6_repack = false; // opt-in lossless row-plane storage; requires native_dense_q6
     // the token embedding, copied out of the file (rows of n_embd in the GGUF's type; one is dequantized per token)
     const uint8_t* tok_embd = nullptr;
     uint32_t tok_embd_type = 0;
@@ -116,6 +124,8 @@ public:
 
     /// with_mtp: load the MTP block when the file has one.
     bool load(const std::string& path, bool with_mtp, std::string& err);
+    int64_t release_lm_head();  // returns device bytes lent; valid only when phase_lm_head is enabled
+    void restore_lm_head();
     void embed(int token, float* out) const;   // dequantize one embedding row (host)
     ~Model();
 
@@ -126,8 +136,20 @@ private:
     int64_t dev_used_ = 0, dev_cap_ = 0;
     std::vector<uint8_t*> pinned_;
     std::vector<uint8_t> tok_embd_copy_;
+    std::vector<int8_t> head_qs_;
+    std::vector<uint16_t> head_d_;
+    uint8_t* head_dev_ = nullptr;
+    int64_t head_dev_bytes_ = 0;
+    uint8_t* expert_cache_base_ = nullptr;
+    void* expert_cache_file_ = nullptr;
+    void* expert_cache_mapping_ = nullptr;
+    bool fast_expert_conversion_ = false;
+    bool open_expert_cache(const std::string& cache_path, const std::string& source_path,
+                           int& completed_layers, std::string& err);
+    bool flush_expert_cache_layer(int il, std::string& err);
     void* dev_alloc(int64_t bytes);
-    DQ8 upload_q8(const std::vector<const GgufTensor*>& parts);
+    DQ8 upload_q8(const std::vector<const GgufTensor*>& parts, bool host = false);
+    int64_t dense_upload_bytes(const std::vector<const GgufTensor*>& parts) const;
     DF32 upload_f32(const std::vector<const GgufTensor*>& parts);
     const float* upload_vec(const GgufTensor& t);
 };
