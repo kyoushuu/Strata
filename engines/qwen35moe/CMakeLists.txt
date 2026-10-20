@@ -86,7 +86,7 @@ if(SQ_ENABLE_PREFILL_MMQ)
 
   get_filename_component(_sq_qwen_root "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
   set(_sq_ggcuda "${SQ_LLAMA_DIR}/ggml/src/ggml-cuda")
-  set(_sq_mmq_types q2_0 q2_k q3_k iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
+  set(_sq_mmq_types q2_0 q2_k q3_k q4_k q5_k q5_1 q6_k iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
   add_library(sq_prefill_mmq STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill_mmq.cu"
     "${_sq_qwen_root}/src/prefill/ggml_cuda_host.cu"
@@ -103,7 +103,7 @@ if(SQ_ENABLE_PREFILL_MMQ)
     target_compile_options(sq_prefill_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
   endif()
   target_link_libraries(sq_prefill_mmq PUBLIC ggml-base CUDA::cudart_static)
-  target_compile_definitions(sq_prefill_mmq PRIVATE STRATA_MMQ_Q23_K=1)
+  target_compile_definitions(sq_prefill_mmq PRIVATE STRATA_MMQ_Q23_K=1 STRATA_MMQ_KQUANTS=1 STRATA_Q6K_EXPERTS=1)
   target_link_libraries(sq_core PUBLIC sq_prefill_mmq)
   target_compile_definitions(sq_core PUBLIC SQ_PREFILL_MMQ=1)
 endif()
