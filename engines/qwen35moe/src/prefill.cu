@@ -1011,8 +1011,13 @@ bool Prefill::init(std::string& err) {
     if (const char* v = std::getenv("STRATA_PREFILL_MMQ"); v && *v && std::strcmp(v, "0") != 0) {
         for (size_t i = 0; i < e_.model_.layers.size(); ++i) {
             const LayerW& L = e_.model_.layers[i];
-            P.mmq_layer[i] = strata::prefill::mmq::fits((int)L.t_gu, 2 * kFF) &&
-                             strata::prefill::mmq::fits((int)L.t_down, kE);
+            const bool gu_fits = strata::prefill::mmq::fits((int)L.t_gu, 2 * kFF);
+            const bool down_fits = strata::prefill::mmq::fits((int)L.t_down, kE);
+            P.mmq_layer[i] = gu_fits && down_fits;
+            if (!P.mmq_layer[i]) {
+                log("MMQ eligibility: layer %zu: gate/up type %u fits=%d; down type %u fits=%d",
+                    i, L.t_gu, gu_fits ? 1 : 0, L.t_down, down_fits ? 1 : 0);
+            }
             P.use_mmq |= P.mmq_layer[i] != 0;
         }
     }
