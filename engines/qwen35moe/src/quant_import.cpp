@@ -246,6 +246,19 @@ void dequantize_row_iq3_s(const block_iq3_s * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+void dequantize_row_iq4_nl(const block_iq4_nl * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK4_NL == 0);
+    const int64_t nb = k / QK4_NL;
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        const uint8_t * qs = x[i].qs;
+        for (int j = 0; j < QK4_NL / 2; ++j) {
+            y[j] = d * kvalues_iq4nl[qs[j] & 0x0f];
+            y[j + QK4_NL / 2] = d * kvalues_iq4nl[qs[j] >> 4];
+        }
+        y += QK4_NL;
+    }
+}
 void dequantize_row_iq4_xs(const block_iq4_xs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_K == 0);
     const int64_t nb = k / QK_K;
@@ -348,6 +361,7 @@ void dequant_import(uint32_t type, const void* src, float* y, int64_t n) {
         case T_Q3_K: dequantize_row_q3_K((const block_q3_K*)src, y, n); break;
         case T_IQ2_S: dequantize_row_iq2_s((const block_iq2_s*)src, y, n); break;
         case T_IQ3_S: dequantize_row_iq3_s((const block_iq3_s*)src, y, n); break;
+        case T_IQ4_NL: dequantize_row_iq4_nl((const block_iq4_nl*)src, y, n); break;
         case T_IQ4_XS: dequantize_row_iq4_xs((const block_iq4_xs*)src, y, n); break;
         default: assert(false && "unsupported import type"); break;
     }

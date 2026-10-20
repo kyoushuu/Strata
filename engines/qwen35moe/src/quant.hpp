@@ -10,7 +10,7 @@
 namespace sq {
 
 enum GgmlType : uint32_t {
-    T_F32 = 0, T_F16 = 1, T_Q8_0 = 8, T_Q2_K = 10, T_Q3_K = 11, T_IQ3_S = 21, T_IQ2_S = 22, T_IQ4_XS = 23, T_Q4_K = 12, T_Q5_K = 13, T_Q6_K = 14, T_BF16 = 30,
+    T_F32 = 0, T_F16 = 1, T_Q8_0 = 8, T_Q2_K = 10, T_Q3_K = 11, T_IQ4_NL = 20, T_IQ3_S = 21, T_IQ2_S = 22, T_IQ4_XS = 23, T_Q4_K = 12, T_Q5_K = 13, T_Q6_K = 14, T_BF16 = 30,
 };
 
 constexpr int QK_K = 256;
@@ -30,7 +30,7 @@ static_assert(sizeof(BlockQ6_K) == 210);
 inline const char* type_name(uint32_t t) {
     switch (t) {
         case T_Q2_K: return "Q2_K"; case T_Q3_K: return "Q3_K";
-        case T_IQ2_S: return "IQ2_S"; case T_IQ3_S: return "IQ3_S"; case T_IQ4_XS: return "IQ4_XS";
+        case T_IQ2_S: return "IQ2_S"; case T_IQ3_S: return "IQ3_S"; case T_IQ4_NL: return "IQ4_NL"; case T_IQ4_XS: return "IQ4_XS";
         case T_F32: return "F32"; case T_F16: return "F16"; case T_Q8_0: return "Q8_0";
         case T_Q4_K: return "Q4_K"; case T_Q5_K: return "Q5_K"; case T_Q6_K: return "Q6_K"; case T_BF16: return "BF16";
         default: return "?";
@@ -46,6 +46,7 @@ inline int64_t row_bytes(uint32_t t, int64_t n) {
         case T_Q2_K: return n / 256 * 84;
         case T_Q3_K: case T_IQ3_S: return n / 256 * 110;
         case T_IQ2_S: return n / 256 * 82;
+        case T_IQ4_NL: return n / 32 * 18;
         case T_IQ4_XS: return n / 256 * 136;
         case T_Q4_K: return n / 256 * 144;
         case T_Q5_K: return n / 256 * 176;
@@ -203,7 +204,7 @@ inline void dequant_row(uint32_t type, const void* src, float* y, int64_t n) {
         case T_Q4_K: dequant_q4_K(src, y, n); break;
         case T_Q5_K: dequant_q5_K(src, y, n); break;
         case T_Q6_K: dequant_q6_K(src, y, n); break;
-        case T_Q2_K: case T_Q3_K: case T_IQ2_S: case T_IQ3_S: case T_IQ4_XS:
+        case T_Q2_K: case T_Q3_K: case T_IQ2_S: case T_IQ3_S: case T_IQ4_NL: case T_IQ4_XS:
             dequant_import(type, src, y, n); break;
         default: break;
     }
@@ -213,7 +214,7 @@ inline void dequant_row(uint32_t type, const void* src, float* y, int64_t n) {
 inline bool can_dequant(uint32_t type) {
     switch (type) {
         case T_F32: case T_F16: case T_BF16: case T_Q8_0: case T_Q4_K: case T_Q5_K: case T_Q6_K:
-        case T_Q2_K: case T_Q3_K: case T_IQ2_S: case T_IQ3_S: case T_IQ4_XS: return true;
+        case T_Q2_K: case T_Q3_K: case T_IQ2_S: case T_IQ3_S: case T_IQ4_NL: case T_IQ4_XS: return true;
         default: return false;
     }
 }
